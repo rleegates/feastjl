@@ -2,198 +2,223 @@ include("mybicgstab.jl")
 
 #one-sided FEAST for linear eigenvalue problems
 function feast_linear(A,B,x0,nc,emid,ra,rb,eps,maxit;log=false, insideEps=1e-2, set_nin=false)
-    (n,m0)=size(x0)
+	 (n,m0)=size(x0)
 
-    integrand(z,x,lest,data,resvecs)=\(z*B-A,B*x)
+	 integrand(z,x,lest,data,resvecs)=\(z*B-A,B*x)
 
-    function rrsolve(Q)
-        Aq=Q'*A*Q
-        Bq=Q'*B*Q
+	 function rrsolve(Q)
+		  Aq=Q'*A*Q
+		  Bq=Q'*B*Q
 
-        le,xe=eigen(Aq,Bq)
-        return (le,Q*xe)
-    end
+		  le,xe=eigen(Aq,Bq)
+		  return (le,Q*xe)
+	 end
 
-    Tf(l,x)=(B*x*diagm( 0 => l)-A*x)
+	 Tf(l,x)=(B*x*diagm( 0 => l)-A*x)
 
-    return feast_core(Tf,integrand,rrsolve,x0,nc,emid,ra,rb,eps,maxit;log=log,insideEps=insideEps, set_nin=set_nin)
+	 return feast_core(Tf,integrand,rrsolve,x0,nc,emid,ra,rb,eps,maxit;log=log,insideEps=insideEps, set_nin=set_nin)
 
 end
 
-
+using SparseArrays
 #two-sided FEAST for linear eigenvalue problems
-function feastNS_linear(A,B,x0,y0,nc,emid,ra,rb,eps,maxit; log=false,insideEps=1e-2)
-    (n,m0)=size(x0)
+function feastNS_linear(A,B,x0,y0,nc,emid,ra,rb,eps,maxit; log=false,insideEps=1e-2, solver=(\), factorizer=lu, FactoType=SuiteSparse.UMFPACK.UmfpackLU{promote_type(A,B),Int64})
+	 (n,m0)=size(x0)
+	 if eltype(A) <: Complex || eltype(B) <: Complex
+			 #A32, B32 = convert(SparseMatrixCSC{ComplexF32,Int64}, A), convert(SparseMatrixCSC{ComplexF32,Int64}, B)
+	else
+		#A32, B32 = convert(SparseMatrixCSC{Float32,Int64}, A), convert(SparseMatrixCSC{Float32,Int64}, B)
+	end
+	A32, B32 = A, B
 
-    integrand(z,x,lest,data,resvecs)=\(z*B-A,B*x)
-    hintegrand(z,y,lest,hdata,hresvecs)=\((z*B-A)',B'*y)
+	integrand, hintegrand, facto, hfacto, Tf, hTf = let A32=A32, B32=B32, A=A, B=B
+		 ((factor,x,lest,data,resvecs)->solver(factor,B32*x),
+		 (factor,y,lest,hdata,hresvecs)->solver(factor,B32'*y),
+		 z->factorizer(z*B32-A32),
+		 z->factorizer(convert(SparseMatrixCSC, (z*B32-A32)')) ,
+		 (l,x)->begin
+			 println("X times EV")
+			 tmp1 = x*spdiagm(0 => l)
+			 println("B times (X times EV)")
+			 B1 = B*tmp1
+			 println("A times X")
+			 A1 = A*x
+			 return B1 - A1
+		end,
+		(l,y)->begin
+			println("Y times EV*")
+			tmp1 = y*spdiagm(0 => conj.(l))
+			println("B* times (Y times EV*)")
+			B1 = B'*tmp1
+			println("A* times X")
+			A1 = A'*y
+			return B1 - A1
+	  end)
+	 end
+	 function rrsolvens(Q,R)
+		  Aq=R'*(A*Q)
+		  Bq=R'*(B*Q)
+		  (ye,le,xe)=nseig(Aq,Bq)
+		  return (R*ye,le,Q*xe)
+	 end
 
-    function rrsolvens(Q,R)
-        Aq=R'*A*Q
-        Bq=R'*B*Q
-        (ye,le,xe)=nseig(Aq,Bq)
-        return (R*ye,le,Q*xe)
-    end
+	 #hTf(l,y)=B'*(y*spdiagm(0 => l)')-A'*y
 
-    Tf(l,x)=(B*x*spdiagm(0 => l)-A*x)
-    hTf(l,y)=B'*y*spdiagm(0 => l)'-A'*y
-
-    #use SVD to B-biorthogonalize subspaces
-    function biortho(Q,R)
-        Bq=R'*B*Q
-        (u,s,v)=svd(Bq)
-        Y=R*u*diagm( 0 => 1 ./sqrt.(s))
-        X=Q*v*diagm( 0 => 1 ./sqrt.(s))
-        return (X,Y)
-    end
-
-    return feastNS_core(Tf,hTf,integrand,hintegrand,rrsolvens,biortho,x0,y0,nc,emid,ra,rb,eps,maxit; log=log, insideEps=insideEps)
+	 #use SVD to B-biorthogonalize subspaces
+	 function biortho(Q,R)
+		  Bq=R'*(B*Q)
+		  (u,s,v)=svd(Bq)
+		  Y=R*(u*diagm( 0 => 1 ./sqrt.(s)))
+		  X=Q*(v*diagm( 0 => 1 ./sqrt.(s)))
+		  return (X,Y)
+	 end
+	 return feastNS_core(Tf,hTf,integrand,hintegrand,facto, hfacto,FactoType,rrsolvens,biortho,x0,y0,nc,emid,ra,rb,eps,maxit; log=log, insideEps=insideEps)
 
 end
 
 
 #generalized inexact FEAST algorithm with gmres
 function ifeast_linear(A,B,x0,alpha,isMaxit,nc,emid,ra,rb,eps,maxit;log=false,insideEps=1e-2, verbose=1)
-    (n,m0)=size(x0)
+	 (n,m0)=size(x0)
 
-    function integrand(z,x,lest,data,resvecs)
-        nc=data[:shiftIndex][z]
-        M=(z*B-A)
-        #b=(B*x*diagm(lest)-A*x)
-        #normb=maximum(sqrt.(sum(abs.(b).^2,1)))
+	 function integrand(z,x,lest,data,resvecs)
+		  nc=data[:shiftIndex][z]
+		  M=(z*B-A)
+		  #b=(B*x*diagm(lest)-A*x)
+		  #normb=maximum(sqrt.(sum(abs.(b).^2,1)))
 
-        int=zeros(ComplexF64,n,m0)
-        maxits=0
-        rhs=convert(Array{ComplexF64,2},resvecs)
+		  int=zeros(ComplexF64,n,m0)
+		  maxits=0
+		  rhs=convert(Array{ComplexF64,2},resvecs)
 
-        for i in 1:m0
-            #(int[:,i],history)=bicgstabl(M,resvecs[:,i],1,max_mv_products=isMaxit,tol=alpha,initial_zero=true,log=true)
-            #(int[:,i],history)=idrs(M,rhs[:,i];maxiter=isMaxit,tol=alpha,log=true)
-            (int[:,i],history)=gmres(M,resvecs[:,i],restart=isMaxit,tol=alpha,initially_zero=true,maxiter=isMaxit,log=true)
-            #(int[:,i],history)=minres(M,resvecs[:,i],tol=alpha,initially_zero=true,maxiter=isMaxit,log=true)
-            nlinits=size(history[:resnorm],1)
-            data[:linIts][i,nc,data[:iterations]]=nlinits
-            #data[:linResiduals][i,nc,data[:iterations]]=history[:resnorm][nlinits]
-            data[:linResiduals][i,nc,data[:iterations]]=norm(resvecs[:,i]-M*int[:,i])/norm(resvecs[:,i])
+		  for i in 1:m0
+				#(int[:,i],history)=bicgstabl(M,resvecs[:,i],1,max_mv_products=isMaxit,tol=alpha,initial_zero=true,log=true)
+				#(int[:,i],history)=idrs(M,rhs[:,i];maxiter=isMaxit,tol=alpha,log=true)
+				(int[:,i],history)=gmres(M,resvecs[:,i],restart=isMaxit,tol=alpha,initially_zero=true,maxiter=isMaxit,log=true)
+				#(int[:,i],history)=minres(M,resvecs[:,i],tol=alpha,initially_zero=true,maxiter=isMaxit,log=true)
+				nlinits=size(history[:resnorm],1)
+				data[:linIts][i,nc,data[:iterations]]=nlinits
+				#data[:linResiduals][i,nc,data[:iterations]]=history[:resnorm][nlinits]
+				data[:linResiduals][i,nc,data[:iterations]]=norm(resvecs[:,i]-M*int[:,i])/norm(resvecs[:,i])
 
-            if(nlinits>maxits)
-                maxits=nlinits
-            end
-        end
-        #int=\(M,resvecs)
-        #println("      linits=$maxits")
-        #int=zbicgstabBlock(M,resvecs,zeros(n,m0),isMaxit,alpha)
-        return (x-int)*spdiagm(0 => 1 ./(z.-lest))
-    end
+				if(nlinits>maxits)
+					 maxits=nlinits
+				end
+		  end
+		  #int=\(M,resvecs)
+		  #println("      linits=$maxits")
+		  #int=zbicgstabBlock(M,resvecs,zeros(n,m0),isMaxit,alpha)
+		  return (x-int)*spdiagm(0 => 1 ./(z.-lest))
+	 end
 
-    function rrsolve(Q)
-        Aq=Q'*A*Q
-        Bq=Q'*B*Q
-        le,xe=eigen(Aq,Bq)
-        return (le,Q*xe)
-    end
+	 function rrsolve(Q)
+		  Aq=Q'*A*Q
+		  Bq=Q'*B*Q
+		  le,xe=eigen(Aq,Bq)
+		  return (le,Q*xe)
+	 end
 
-    Tf(l,x)=(B*x*spdiagm(0 => l)-A*x)
+	 Tf(l,x)=(B*x*spdiagm(0 => l)-A*x)
 
-    return feast_core(Tf,integrand,rrsolve,x0,nc,emid,ra,rb,eps,maxit;log=log,insideEps=insideEps, verbose=verbose)
+	 return feast_core(Tf,integrand,rrsolve,x0,nc,emid,ra,rb,eps,maxit;log=log,insideEps=insideEps, verbose=verbose)
 
 end
 
 #generalized ifeast with bicgstab
 function ifeast_linearBicgstab(A,B,x0,alpha,isMaxit,nc,emid,ra,rb,eps,maxit;log=false,insideEps=1e-2,verbose=1)
-    (n,m0)=size(x0)
+	 (n,m0)=size(x0)
 
-    function integrand(z,x,lest,data,resvecs)
-        nc=data[:shiftIndex][z]
-        M1=(z*B-A)
-        P=speye(n)
-        M=P*M1*P
-        rhs=P*resvecs
-        #b=(B*x*diagm(lest)-A*x)
-        #normb=maximum(sqrt.(sum(abs.(b).^2,1)))
+	 function integrand(z,x,lest,data,resvecs)
+		  nc=data[:shiftIndex][z]
+		  M1=(z*B-A)
+		  P=speye(n)
+		  M=P*M1*P
+		  rhs=P*resvecs
+		  #b=(B*x*diagm(lest)-A*x)
+		  #normb=maximum(sqrt.(sum(abs.(b).^2,1)))
 
-        int=zeros(ComplexF64,n,m0)
+		  int=zeros(ComplexF64,n,m0)
 
-        for i in 1:m0
-            (int[:,i],history)=bicgstabl(M,resvecs[:,i],1,max_mv_products=isMaxit,tol=alpha,initial_zero=true,log=true)
-            nlinits=size(history[:resnorm],1)
-            data[:linIts][i,nc,data[:iterations]]=nlinits
-            data[:linResiduals][i,nc,data[:iterations]]=history[:resnorm][nlinits]
-        end
+		  for i in 1:m0
+				(int[:,i],history)=bicgstabl(M,resvecs[:,i],1,max_mv_products=isMaxit,tol=alpha,initial_zero=true,log=true)
+				nlinits=size(history[:resnorm],1)
+				data[:linIts][i,nc,data[:iterations]]=nlinits
+				data[:linResiduals][i,nc,data[:iterations]]=history[:resnorm][nlinits]
+		  end
 
 
-        return (x-int)*spdiagm(0 => 1 ./(z.-lest))
-    end
+		  return (x-int)*spdiagm(0 => 1 ./(z.-lest))
+	 end
 
-    function rrsolve(Q)
-        Aq=Q'*A*Q
-        Bq=Q'*B*Q
-        le,xe=eigen(Aq,Bq)
-        return (le,Q*xe)
-    end
+	 function rrsolve(Q)
+		  Aq=Q'*A*Q
+		  Bq=Q'*B*Q
+		  le,xe=eigen(Aq,Bq)
+		  return (le,Q*xe)
+	 end
 
-    Tf(l,x)=(B*x*spdiagm(0 => l)-A*x)
+	 Tf(l,x)=(B*x*spdiagm(0 => l)-A*x)
 
-    return feast_core(Tf,integrand,rrsolve,x0,nc,emid,ra,rb,eps,maxit;log=log,insideEps=insideEps,verbose=verbose)
+	 return feast_core(Tf,integrand,rrsolve,x0,nc,emid,ra,rb,eps,maxit;log=log,insideEps=insideEps,verbose=verbose)
 
 end
 
 
 #inexact two-sided ifeast with my own bicgstab implementation
 function ifeastNS_linear(A,B,x0,y0,alpha,isMaxit,nc,emid,ra,rb,eps,maxit; log=false,insideEps=1e-2)
-    (n,m0)=size(x0)
+	 (n,m0)=size(x0)
 
-    #integrand(z,x,lest,data,resvecs)=\(z*B-A,B*x)
-    #hintegrand(z,y,lest,hdata,hresvecs)=\((z*B-A)',B'*y)
-    function integrand(z,x,lest,data,resvecs)
-        M=z*B-A
-        rhs=B*x*spdiagm(0 => lest)-A*x
-        int0=zeros(ComplexF64,n,m0)
-        int=zeros(ComplexF64,n,m0)
-        int=zbicgstabBlock(M,resvecs,int0,isMaxit,alpha)
-        for i in 1:m0
-            #(int[:,i],history)=gmres(M,rhs[:,i],restart=isMaxit,tol=alpha,initially_zero=true,maxiter=isMaxit,log=true)
-            #(int[:,i],history)=bicgstabl(M,rhs[:,i],2,max_mv_products=isMaxit,tol=alpha,initial_zero=true,log=true)
-        end
+	 #integrand(z,x,lest,data,resvecs)=\(z*B-A,B*x)
+	 #hintegrand(z,y,lest,hdata,hresvecs)=\((z*B-A)',B'*y)
+	 function integrand(z,x,lest,data,resvecs)
+		  M=z*B-A
+		  rhs=B*x*spdiagm(0 => lest)-A*x
+		  int0=zeros(ComplexF64,n,m0)
+		  int=zeros(ComplexF64,n,m0)
+		  int=zbicgstabBlock(M,resvecs,int0,isMaxit,alpha)
+		  for i in 1:m0
+				#(int[:,i],history)=gmres(M,rhs[:,i],restart=isMaxit,tol=alpha,initially_zero=true,maxiter=isMaxit,log=true)
+				#(int[:,i],history)=bicgstabl(M,rhs[:,i],2,max_mv_products=isMaxit,tol=alpha,initial_zero=true,log=true)
+		  end
 
-        #int=\(M,resvecs)
-        return (x-int)*spdiagm(0 => 1 ./(z.-(lest)))
-    end
+		  #int=\(M,resvecs)
+		  return (x-int)*spdiagm(0 => 1 ./(z.-(lest)))
+	 end
 
-    function hintegrand(z,y,lest,hdata,hresvecs)
-        M=(z*B-A)'
-        rhs=B'*y*spdiagm(0 => lest)'-A'*y
-        int0=zeros(ComplexF64,n,m0)
-        int=zeros(ComplexF64,n,m0)
-        int=zbicgstabBlock(M,hresvecs,int0,isMaxit,alpha)
-        for i in 1:m0
-            #(int[:,i],history)=gmres(M,rhs[:,i],restart=isMaxit,tol=alpha,initially_zero=true,maxiter=isMaxit,log=true)
+	 function hintegrand(z,y,lest,hdata,hresvecs)
+		  M=(z*B-A)'
+		  rhs=B'*y*spdiagm(0 => lest)'-A'*y
+		  int0=zeros(ComplexF64,n,m0)
+		  int=zeros(ComplexF64,n,m0)
+		  int=zbicgstabBlock(M,hresvecs,int0,isMaxit,alpha)
+		  for i in 1:m0
+				#(int[:,i],history)=gmres(M,rhs[:,i],restart=isMaxit,tol=alpha,initially_zero=true,maxiter=isMaxit,log=true)
 
-            #(int[:,i],history)=bicgstabl(M,rhs[:,i],2,max_mv_products=isMaxit,tol=alpha,initial_zero=true,log=true)
-        end
-        #int=\(M,hresvecs)
-        return (y-int)*spdiagm(0 => 1 ./(z'.-conj.(lest)))
-    end
+				#(int[:,i],history)=bicgstabl(M,rhs[:,i],2,max_mv_products=isMaxit,tol=alpha,initial_zero=true,log=true)
+		  end
+		  #int=\(M,hresvecs)
+		  return (y-int)*spdiagm(0 => 1 ./(z'.-conj.(lest)))
+	 end
 
-    function rrsolvens(Q,R)
-        Aq=R'*A*Q
-        Bq=R'*B*Q
-        (ye,le,xe)=nseig(Aq,Bq)
-        return (R*ye,le,Q*xe)
-    end
+	 function rrsolvens(Q,R)
+		  Aq=R'*A*Q
+		  Bq=R'*B*Q
+		  (ye,le,xe)=nseig(Aq,Bq)
+		  return (R*ye,le,Q*xe)
+	 end
 
-    Tf(l,x)=(B*x*spdiagm(0 => l)-A*x)
-    hTf(l,y)=B'*y*spdiagm(0 => l)'-A'*y
+	 Tf(l,x)=(B*x*spdiagm(0 => l)-A*x)
+	 hTf(l,y)=B'*y*spdiagm(0 => l)'-A'*y
 
-    #use SVD to B-biorthogonalize subspaces
-    function biortho(Q,R)
-        Bq=R'*B*Q
-        (u,s,v)=svd(Bq)
-        Y=R*u*diagm( 0 => 1 ./sqrt.(s))
-        X=Q*v*diagm( 0 => 1 ./sqrt.(s))
-        return (X,Y)
-    end
+	 #use SVD to B-biorthogonalize subspaces
+	 function biortho(Q,R)
+		  Bq=R'*B*Q
+		  (u,s,v)=svd(Bq)
+		  Y=R*u*diagm( 0 => 1 ./sqrt.(s))
+		  X=Q*v*diagm( 0 => 1 ./sqrt.(s))
+		  return (X,Y)
+	 end
 
-    return feastNS_core(Tf,hTf,integrand,hintegrand,rrsolvens,biortho,x0,y0,nc,emid,ra,rb,eps,maxit; log=log, insideEps=insideEps)
+	 return feastNS_core(Tf,hTf,integrand,hintegrand,rrsolvens,biortho,x0,y0,nc,emid,ra,rb,eps,maxit; log=log, insideEps=insideEps)
 
 end

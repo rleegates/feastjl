@@ -27,12 +27,14 @@ Y=inv(X)'
 #generate A-matrix eigenvalues
 L1=zeros(n)
 for i in 1:n
-    L1[i]=i
+	 L1[i]=i
 end
 
 #generate eigenvalue problem matrices
 A=Xb*diagm(0 => sqrt.(Lb))*X*diagm(0 => L1)*Y'*diagm(0 => sqrt.(Lb))*Yb'
 B=Xb*diagm(0 => Lb)*Yb'
+A= sparse(A)
+B = sparse(B)
 
 #FEAST parameters
 emid=1.0+0.0*im #contour center
